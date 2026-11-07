@@ -104,13 +104,20 @@ struct ServerSettings {
     std::string preferredLocationLabel{"Automatico"};
     bool xboxFaceLayout{false};
     int language{0};  // 0 = Espanol, 1 = English
-    int resolution{0};  // 0=auto, 1=720p, 2=720HQ, 3=1080p, 4=1080HQ
+    // 0=auto, 1=720p, 2=720HQ, 3=1080p, 4=1080HQ, 5=540p (FSR source),
+    // 6=480p (FSR source, handheld only).
+    int resolution{0};
     // Settings -> Advanced. codec: 0=auto (H.265 then H.264), 1=H.265, 2=H.264.
     int codec{0};
     // fps: 0=auto (current default), 1=30, 2=60.
     int fps{0};
     // transport: 0=auto (Native UDP preferred), 1=Native UDP (proto: 2), 2=WebRTC (proto: 1).
     int transport{0};
+    // upscaler: 0=off, 1=FSR 1 (EASU upscale + RCAS sharpening).
+    int upscaler{1};
+    // In-stream touchpad drives the virtual mouse. Off means touching the
+    // screen outside the quick menu does nothing.
+    bool mouse{true};
     std::vector<int> favoriteGameIds;
     std::vector<int> recentGameIds;
 };
@@ -136,10 +143,12 @@ ServerSettings load_server_settings() {
             "preferredLocationLabel", std::string("Automatico"));
         settings.xboxFaceLayout = value.value("xboxFaceLayout", false);
         settings.language = std::clamp(value.value("language", 0), 0, 1);
-        settings.resolution = std::clamp(value.value("resolution", 0), 0, 4);
+        settings.resolution = std::clamp(value.value("resolution", 0), 0, 6);
         settings.codec = std::clamp(value.value("codec", 0), 0, 2);
         settings.fps = std::clamp(value.value("fps", 0), 0, 2);
         settings.transport = std::clamp(value.value("transport", 0), 0, 2);
+        settings.upscaler = std::clamp(value.value("upscaler", 1), 0, 1);
+        settings.mouse = value.value("mouse", true);
         settings.favoriteGameIds = value.value(
             "favoriteGameIds", std::vector<int>{});
         settings.recentGameIds = value.value(
@@ -155,7 +164,7 @@ bool save_server_settings(const ServerSettings& settings) {
     std::ofstream file("sdmc:/switch/ZERODROID/settings.json");
     if (!file.is_open()) return false;
     file << nlohmann::json({
-        {"version", 5},
+        {"version", 6},
         {"allowDistantRegions", settings.allowDistantRegions},
         {"preferredLocationId", settings.preferredLocationId},
         {"preferredLocationLabel", settings.preferredLocationLabel},
@@ -165,6 +174,8 @@ bool save_server_settings(const ServerSettings& settings) {
         {"codec", settings.codec},
         {"fps", settings.fps},
         {"transport", settings.transport},
+        {"upscaler", settings.upscaler},
+        {"mouse", settings.mouse},
         {"favoriteGameIds", settings.favoriteGameIds},
         {"recentGameIds", settings.recentGameIds},
     }).dump(2);
@@ -291,6 +302,7 @@ enum class SettingsRowId {
     Codec,
     Fps,
     Transport,
+    Upscaler,
     Language,
     Logout,
 };
@@ -305,6 +317,7 @@ std::vector<SettingsRowId> settings_rows(bool advancedOpen) {
         rows.push_back(SettingsRowId::Codec);
         rows.push_back(SettingsRowId::Fps);
         rows.push_back(SettingsRowId::Transport);
+        rows.push_back(SettingsRowId::Upscaler);
     }
     rows.push_back(SettingsRowId::Language);
     rows.push_back(SettingsRowId::Logout);
@@ -316,8 +329,9 @@ std::vector<SettingsRowId> settings_rows(bool advancedOpen) {
 // belongs to the panel; a tap outside closes it.
 bool handle_stream_settings_touch(gnx::stream::QuickMenuState& state,
                                   int x, int y, bool& layoutChanged,
-                                  bool& leaveRequested) {
+                                  bool& mouseChanged, bool& leaveRequested) {
     layoutChanged = false;
+    mouseChanged = false;
     leaveRequested = false;
     if (point_in_rect(x, y, gnx::stream::kQuickToggleRect)) {
         state.open = !state.open;
@@ -345,6 +359,12 @@ bool handle_stream_settings_touch(gnx::stream::QuickMenuState& state,
                              gnx::stream::QuickController))) {
         state.xboxFaceLayout = !state.xboxFaceLayout;
         layoutChanged = true;
+        changed = true;
+    } else if (point_in_rect(
+                   x, y,
+                   gnx::stream::quick_row_rect(gnx::stream::QuickMouse))) {
+        state.mouse = !state.mouse;
+        mouseChanged = true;
         changed = true;
     } else if (point_in_rect(x, y, gnx::stream::kQuickResetRect)) {
         state.brightness = 0;
@@ -478,6 +498,7 @@ int main(int argc, char* argv[]) {
     };
     gnx::stream::QuickMenuState quickMenuState;
     quickMenuState.xboxFaceLayout = serverSettings.xboxFaceLayout;
+    quickMenuState.mouse = serverSettings.mouse;
     auto stream = std::make_unique<gnx::stream::Engine>(api, gfx.renderer());
     stream->set_xbox_face_layout(serverSettings.xboxFaceLayout);
     stream->set_quick_menu_state(quickMenuState);
@@ -495,6 +516,10 @@ int main(int argc, char* argv[]) {
             : serverSettings.transport == 2
                   ? gnx::stream::TransportPreference::WebRtc
                   : gnx::stream::TransportPreference::Auto);
+    stream->set_upscaler_preference(
+        serverSettings.upscaler == 1
+            ? gnx::stream::UpscalerPreference::Fsr1
+            : gnx::stream::UpscalerPreference::Off);
     ZERODROID::DeviceCodeAuthArtifact authArtifact;
 
     bool hasSession = api.loadSessionFromSD();
@@ -712,14 +737,15 @@ int main(int argc, char* argv[]) {
                     touchOnUi =
                         quickMenuState.open ||
                         point_in_rect(x, y, gnx::stream::kQuickToggleRect);
-                    if (!touchOnUi) {
+                    if (!touchOnUi && quickMenuState.mouse) {
                         // First touchpad contact: show the cursor at centre.
                         stream->virtual_mouse_move(0.0f, 0.0f);
                     }
                 } else {
                     const int moveX = x - touchLastX;
                     const int moveY = y - touchLastY;
-                    if (!touchOnUi && (moveX != 0 || moveY != 0)) {
+                    if (!touchOnUi && quickMenuState.mouse &&
+                        (moveX != 0 || moveY != 0)) {
                         if (std::abs(x - touchDownX) >
                                 kVirtualMouseMoveThreshold ||
                             std::abs(y - touchDownY) >
@@ -741,10 +767,11 @@ int main(int argc, char* argv[]) {
                     if (dx < 100 && dy < 100) {
                         const bool wasOpen = quickMenuState.open;
                         bool layoutChanged = false;
+                        bool mouseChanged = false;
                         const bool quickTouch =
                             handle_stream_settings_touch(
                                 quickMenuState, touchLastX, touchLastY,
-                                layoutChanged, leaveFromMenu);
+                                layoutChanged, mouseChanged, leaveFromMenu);
                         if (quickTouch || wasOpen != quickMenuState.open) {
                             stream->set_quick_menu_state(quickMenuState);
                         }
@@ -755,8 +782,17 @@ int main(int argc, char* argv[]) {
                                 serverSettings.xboxFaceLayout);
                             save_server_settings(serverSettings);
                         }
+                        if (mouseChanged) {
+                            serverSettings.mouse = quickMenuState.mouse;
+                            save_server_settings(serverSettings);
+                            if (!quickMenuState.mouse) {
+                                // Drop a cursor that may already be on screen.
+                                stream->virtual_mouse_hide();
+                            }
+                        }
                     }
-                } else if (!touchMoved && dx < kVirtualMouseMoveThreshold &&
+                } else if (quickMenuState.mouse && !touchMoved &&
+                           dx < kVirtualMouseMoveThreshold &&
                            dy < kVirtualMouseMoveThreshold) {
                     const uint64_t heldMs =
                         SDL_GetTicks64() - touchDownAt;
@@ -765,7 +801,8 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            if (SDL_GetTicks64() - lastTouchAt >= kVirtualMouseHideMs) {
+            if (quickMenuState.mouse &&
+                SDL_GetTicks64() - lastTouchAt >= kVirtualMouseHideMs) {
                 stream->virtual_mouse_hide();
             }
 
@@ -1069,7 +1106,7 @@ int main(int argc, char* argv[]) {
                 const int direction =
                     (navDown & HidNpadButton_Left) ? -1 : 1;
                 serverSettings.resolution =
-                    (serverSettings.resolution + direction + 5) % 5;
+                    (serverSettings.resolution + direction + 7) % 7;
                 save_server_settings(serverSettings);
                 switch (serverSettings.resolution) {
                     case 1:
@@ -1087,6 +1124,16 @@ int main(int argc, char* argv[]) {
                     case 4:
                         libraryNotice = ui("Resolucion de streaming: 1080HQ.",
                                            "Streaming resolution: 1080HQ.");
+                        break;
+                    case 5:
+                        libraryNotice = ui(
+                            "Resolucion de streaming: 540p (fuente FSR, 10 Mbps).",
+                            "Streaming resolution: 540p (FSR source, 10 Mbps).");
+                        break;
+                    case 6:
+                        libraryNotice = ui(
+                            "Resolucion de streaming: 480p (fuente FSR, 7 Mbps).",
+                            "Streaming resolution: 480p (FSR source, 7 Mbps).");
                         break;
                     default:
                         libraryNotice = ui("Resolucion de streaming: Auto.",
@@ -1154,6 +1201,23 @@ int main(int argc, char* argv[]) {
                                    "Protocol: WebRTC (RTP, NACK and PLI).")
                               : ui("Protocolo: Auto (UDP Nativo preferido).",
                                    "Protocol: Auto (Native UDP preferred).");
+            }
+            if (current == SettingsRowId::Upscaler && cycle) {
+                const int direction =
+                    (navDown & HidNpadButton_Left) ? -1 : 1;
+                serverSettings.upscaler =
+                    (serverSettings.upscaler + direction + 2) % 2;
+                stream->set_upscaler_preference(
+                    serverSettings.upscaler == 1
+                        ? gnx::stream::UpscalerPreference::Fsr1
+                        : gnx::stream::UpscalerPreference::Off);
+                save_server_settings(serverSettings);
+                libraryNotice =
+                    serverSettings.upscaler == 1
+                        ? ui("Escalador: FSR 1 (AMD FidelityFX Super Resolution).",
+                             "Upscaler: FSR 1 (AMD FidelityFX Super Resolution).")
+                        : ui("Escalador: desactivado (muestreo bilineal).",
+                             "Upscaler: off (bilinear sampling).");
             }
             if (current == SettingsRowId::Language && cycle) {
                 serverSettings.language = serverSettings.language == 0 ? 1 : 0;
@@ -1249,6 +1313,7 @@ int main(int argc, char* argv[]) {
                 quickMenuState.ping = false;  // every new session starts hidden
                 quickMenuState.xboxFaceLayout =
                     serverSettings.xboxFaceLayout;
+                quickMenuState.mouse = serverSettings.mouse;
                 stream->set_xbox_face_layout(serverSettings.xboxFaceLayout);
                 stream->set_stream_resolution(serverSettings.resolution);
                 stream->set_codec_preference(
@@ -1264,6 +1329,10 @@ int main(int argc, char* argv[]) {
                         : serverSettings.transport == 2
                               ? gnx::stream::TransportPreference::WebRtc
                               : gnx::stream::TransportPreference::Auto);
+                stream->set_upscaler_preference(
+                    serverSettings.upscaler == 1
+                        ? gnx::stream::UpscalerPreference::Fsr1
+                        : gnx::stream::UpscalerPreference::Off);
                 stream->set_quick_menu_state(quickMenuState);
                 stream->start(game.id);
             }
@@ -1447,6 +1516,8 @@ int main(int argc, char* argv[]) {
                     case 2: resolutionLabel = "720HQ"; break;
                     case 3: resolutionLabel = "1080p"; break;
                     case 4: resolutionLabel = "1080HQ"; break;
+                    case 5: resolutionLabel = "540p FSR"; break;
+                    case 6: resolutionLabel = "480p FSR"; break;
                     default: break;
                 }
                 gfx.text_centered(resolutionLabel,
@@ -1459,8 +1530,8 @@ int main(int argc, char* argv[]) {
                 gfx.text(ui("Avanzado", "Advanced"),
                          advancedRow.x + 40, advancedRow.y + 52,
                          gnx::gfx::FontSize::Body, gnx::gfx::kText);
-                gfx.text(ui("Codec de video y limite de FPS",
-                            "Video codec and FPS limit"),
+                gfx.text(ui("Codec, FPS, red y escalador",
+                            "Codec, FPS, network and upscaler"),
                          advancedRow.x + 40, advancedRow.y + 96,
                          gnx::gfx::FontSize::Small, gnx::gfx::kTextDim);
                 SDL_Rect advancedChip = {
@@ -1527,6 +1598,24 @@ int main(int argc, char* argv[]) {
                     gfx.text_centered(transportLabel,
                                       transportChip.x + transportChip.w / 2,
                                       transportChip.y + 18,
+                                      gnx::gfx::FontSize::Small,
+                                      gnx::gfx::kText);
+
+                    SDL_Rect upscalerRow =
+                        drawCard(rowOf(SettingsRowId::Upscaler));
+                    gfx.text(ui("Escalador de imagen", "Image upscaler"),
+                             upscalerRow.x + 40, upscalerRow.y + 70,
+                             gnx::gfx::FontSize::Body, gnx::gfx::kText);
+                    SDL_Rect upscalerChip = {
+                        upscalerRow.x + upscalerRow.w - 330,
+                        upscalerRow.y + 52, 260, 64};
+                    gfx.fill(upscalerChip, serverSettings.upscaler == 1
+                        ? gnx::gfx::Color{16, 110, 80} : gnx::gfx::kBar);
+                    gfx.frame(upscalerChip, gnx::gfx::kFocus, 2);
+                    gfx.text_centered(serverSettings.upscaler == 1
+                                          ? "FSR 1" : "OFF",
+                                      upscalerChip.x + upscalerChip.w / 2,
+                                      upscalerChip.y + 18,
                                       gnx::gfx::FontSize::Small,
                                       gnx::gfx::kText);
                 }
